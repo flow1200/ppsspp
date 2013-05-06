@@ -19,6 +19,15 @@
 #include "HLE.h"
 #include "../HW/MediaEngine.h"
 
+#ifdef USE_FFMPEG
+extern "C" {
+	#include <libavutil/opt.h>
+	#include <libavformat/avformat.h>
+	#include <libswresample/swresample.h>
+	#include <libavutil/samplefmt.h>
+}
+#endif
+
 static const int MP3_BITRATES[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
 
 struct Mp3Context {	
@@ -37,10 +46,9 @@ struct Mp3Context {
 		p.Do(mp3PcmBuf);
 		p.Do(mp3BufPendingSize);
 		p.Do(mp3PcmBufSize);
-		p.Do(mp3InputFileReadPos);
-		p.Do(mp3InputBufWritePos);
-		p.Do(mp3InputBufSize);
-		p.Do(mp3InputFileSize);
+		p.Do(bufferRead);
+		p.Do(bufferWrite);
+		p.Do(bufferAvailable);
 		p.Do(mp3DecodedBytes);
 		p.Do(mp3LoopNum);
 		p.Do(mp3MaxSamples);
@@ -55,16 +63,17 @@ struct Mp3Context {
 	u64 mp3StreamStart;
 	u64 mp3StreamEnd;
 	u64 mp3StreamPosition;
+
 	u32 mp3Buf;
 	int mp3BufSize;
 	int mp3BufPendingSize;
 	u32 mp3PcmBuf;
 	int mp3PcmBufSize;
 
-	int mp3InputFileReadPos;
-	int mp3InputBufWritePos;
-	int mp3InputBufSize;
-	int mp3InputFileSize;
+	int bufferRead;
+	int bufferWrite;
+	int bufferAvailable;
+
 	int mp3DecodedBytes;
 	int mp3LoopNum;
 	int mp3MaxSamples;
@@ -75,6 +84,13 @@ struct Mp3Context {
 	int mp3Version;
 
 	MediaEngine *mediaengine;
+#ifdef USE_FFMPEG
+  AVFormatContext *avformat_context;
+  AVIOContext	  *avio_context;
+  AVCodecContext  *decoder_context;
+  SwrContext      *resampler_context;
+  int audio_stream_index;
+#endif
 };
 
 
@@ -112,7 +128,53 @@ int sceMp3Decode(u32 mp3, u32 outPcmPtr) {
 	Memory::Memset(ctx->mp3PcmBuf, 0, ctx->mp3PcmBufSize);
 	Memory::Write_U32(ctx->mp3PcmBuf, outPcmPtr);
 
-	// TODO: Actually decode the data
+#ifndef USE_FFMPEG
+	ctx->mp3StreamPosition += ctx->mp3BufPendingSize;
+	if(ctx->mp3StreamPosition > ctx->mp3StreamEnd)
+		ctx->mp3StreamPosition = ctx->mp3StreamEnd;
+
+	// Reset the pending buffer size so the program will know that we need to buffer more data
+	ctx->mp3BufPendingSize = (ctx->mp3StreamPosition < ctx->mp3StreamEnd)?-1:0;
+
+	return ctx->mp3PcmBufSize;
+#else
+  AVFrame frame;
+  AVPacket packet;
+  int got_frame, ret;
+  int bytesdecoded = 0;
+  static int audio_frame_count = 0;
+
+  while(bytesdecoded < ctx->mp3PcmBufSize) {
+	if ((ret = av_read_frame(ctx->avformat_context, &packet)) < 0)
+	  break;
+
+	if (packet.stream_index == ctx->audio_stream_index) {
+	  avcodec_get_frame_defaults(&frame);
+	  got_frame = 0;
+	  ret = avcodec_decode_audio4(ctx->decoder_context, &frame, &got_frame, &packet);
+	  if (ret < 0) {
+		ERROR_LOG(HLE, "avcodec_decode_audio4: Error decoding audio %d", ret);
+		continue;
+	  }
+	  if (got_frame) {
+		INFO_LOG(HLE, "audio_frame n:%d nb_samples:%d" , audio_frame_count++, frame.nb_samples);
+
+		int decoded = av_samples_get_buffer_size(NULL, frame.channels, frame.nb_samples, (AVSampleFormat)frame.format, 1);
+
+		u8* out = Memory::GetPointer(ctx->mp3PcmBuf + bytesdecoded);
+		ret = swr_convert(ctx->resampler_context, &out, frame.nb_samples, (const u8**)frame.extended_data, frame.nb_samples);
+        if (ret < 0) {
+		  ERROR_LOG(HLE, "swr_convert: Error while converting %d", ret);
+		  return -1;
+        }
+
+		bytesdecoded += decoded;
+	  }
+	}
+	av_free_packet(&packet);
+  }
+  Memory::Write_U32(ctx->mp3PcmBuf, outPcmPtr);
+
 #ifdef _DEBUG
 	char fileName[256];
 	sprintf(fileName, "%lli.mp3", ctx->mp3StreamPosition);
@@ -130,14 +192,8 @@ int sceMp3Decode(u32 mp3, u32 outPcmPtr) {
 	}
 #endif
 
-	ctx->mp3StreamPosition += ctx->mp3BufPendingSize;
-	if(ctx->mp3StreamPosition > ctx->mp3StreamEnd)
-		ctx->mp3StreamPosition = ctx->mp3StreamEnd;
-
-	// Reset the pending buffer size so the program will know that we need to buffer more data
-	ctx->mp3BufPendingSize = (ctx->mp3StreamPosition < ctx->mp3StreamEnd)?-1:0;
-
-	return ctx->mp3PcmBufSize;
+  return bytesdecoded;
+#endif
 }
 
 int sceMp3ResetPlayPosition(u32 mp3) {
@@ -164,6 +220,50 @@ int sceMp3CheckStreamDataNeeded(u32 mp3) {
 	return (ctx->mp3BufPendingSize < 0) && (ctx->mp3StreamPosition < ctx->mp3StreamEnd);
 }
 
+int readFunc(void *opaque, u8 *buf, int buf_size) {
+  Mp3Context *ctx = static_cast<Mp3Context*>(opaque);
+
+  int res = 0;
+
+  while(ctx->bufferAvailable && buf_size) {
+	// Maximum bytes we can read
+	int to_read = std::min(ctx->bufferAvailable, buf_size);
+
+	// Don't read past the end if the buffer loops
+	to_read = std::min(ctx->mp3BufSize - ctx->bufferRead, to_read);
+	memcpy(buf + res, Memory::GetCharPointer(ctx->mp3Buf + ctx->bufferRead), to_read);
+
+	ctx->bufferRead += to_read;
+	if(ctx->bufferRead == ctx->mp3BufSize)
+	  ctx->bufferRead = 0;
+	ctx->bufferAvailable -= to_read;
+	res += to_read;
+  }
+
+  if(ctx->bufferAvailable == 0) {
+	ctx->bufferRead = 0;
+	ctx->bufferWrite = 0;
+  }
+
+#if 0 && defined(_DEBUG)
+  char fileName[256];
+  sprintf(fileName, "out.mp3");
+
+  FILE * file = fopen(fileName, "a+b");
+  if(file) {
+	if(!Memory::IsValidAddress(ctx->mp3Buf)) {
+	  ERROR_LOG(HLE, "sceMp3Decode mp3Buf %08X is not a valid address!", ctx->mp3Buf);
+	}
+
+	fwrite(buf, 1, res, file);
+
+	fclose(file);
+  }
+#endif
+
+  return res;
+}
+
 u32 sceMp3ReserveMp3Handle(u32 mp3Addr) {
 	DEBUG_LOG(HLE, "sceMp3ReserveMp3Handle(%08x)", mp3Addr);
 	Mp3Context *ctx = new Mp3Context;
@@ -184,6 +284,11 @@ u32 sceMp3ReserveMp3Handle(u32 mp3Addr) {
 	/*ctx->mp3Channels = 2;
 	ctx->mp3Bitrate = 128;
 	ctx->mp3SamplingRate = 44100;*/
+
+#ifdef USE_FFMPEG
+  ctx->avformat_context = NULL;
+  ctx->avio_context = NULL;
+#endif
 
 	mp3Map[mp3Addr] = ctx;
 	return mp3Addr;
@@ -243,6 +348,62 @@ int sceMp3Init(u32 mp3) {
 		ctx->mp3SamplingRate = 0;
 	
 	ctx->mp3Version = ((header >> 19) & 0x3);
+
+#ifdef USE_FFMPEG
+  u8* avio_buffer = static_cast<u8*>(av_malloc(ctx->mp3BufSize));
+  ctx->avio_context = avio_alloc_context(avio_buffer, ctx->mp3BufSize, 0, ctx, readFunc, NULL, NULL);
+  ctx->avformat_context = avformat_alloc_context();
+  ctx->avformat_context->pb = ctx->avio_context;
+
+  int ret;
+  if((ret = avformat_open_input(&ctx->avformat_context, NULL, av_find_input_format("mp3"), NULL)) < 0) {
+	ERROR_LOG(HLE, "avformat_open_input: Cannot open input %d", ret);
+	return -1;
+  }
+
+  if ((ret = avformat_find_stream_info(ctx->avformat_context, NULL)) < 0) {
+	ERROR_LOG(HLE, "avformat_find_stream_info: Cannot find stream information %d", ret);
+    return -1;
+  }
+
+  AVCodec *dec;
+
+  /* select the audio stream */
+  ret = av_find_best_stream(ctx->avformat_context, AVMEDIA_TYPE_AUDIO, -1, -1, &dec, 0);
+  if (ret < 0) {
+	ERROR_LOG(HLE, "av_find_best_stream: Cannot find a audio stream in the input file %d", ret);
+	return -1;
+  }
+  ctx->audio_stream_index = ret;
+  ctx->decoder_context = ctx->avformat_context->streams[ctx->audio_stream_index]->codec;
+  
+  /* init the audio decoder */
+  if ((ret = avcodec_open2(ctx->decoder_context, dec, NULL)) < 0) {
+	ERROR_LOG(HLE, "avcodec_open2: Cannot open audio decoder %d", ret);
+	return -1;
+  }
+
+  ctx->resampler_context = swr_alloc_set_opts(NULL,
+											  ctx->decoder_context->channel_layout,
+											  AV_SAMPLE_FMT_S16,
+											  ctx->decoder_context->sample_rate,
+											  ctx->decoder_context->channel_layout,
+											  ctx->decoder_context->sample_fmt,
+											  ctx->decoder_context->sample_rate,
+											  0, NULL);
+  if (!ctx->resampler_context) {
+	ERROR_LOG(HLE, "swr_alloc_set_opts: Could not allocate resampler context %d", ret);
+	return -1;
+  }
+
+  if ((ret = swr_init(ctx->resampler_context)) < 0) {
+	ERROR_LOG(HLE, "swr_init: Failed to initialize the resampling context %d", ret);
+	return -1;
+  }
+
+  av_dump_format(ctx->avformat_context, 0, "mp3", 0);
+#endif
+
 	return 0;
 }
 
@@ -353,6 +514,11 @@ int sceMp3ReleaseMp3Handle(u32 mp3) {
 		ERROR_LOG(HLE, "%s: bad mp3 handle %08x", __FUNCTION__, mp3);
 		return -1;
 	}
+#ifdef USE_FFMPEG
+  av_free(ctx->avio_context->buffer);
+  av_free(ctx->avio_context);
+#endif
+
 	mp3Map.erase(mp3Map.find(mp3));
 	delete ctx;
 	return 0;
